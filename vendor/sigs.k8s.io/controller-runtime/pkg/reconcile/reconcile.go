@@ -17,6 +17,8 @@ limitations under the License.
 package reconcile
 
 import (
+	"time"
+
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -24,6 +26,10 @@ import (
 type Result struct {
 	// Requeue tells the Controller to requeue the reconcile key.  Defaults to false.
 	Requeue bool
+
+	// RequeueAfter if greater than 0, tells the Controller to requeue the reconcile key after the Duration.
+	// Implies that Requeue is true, there is no need to set Requeue to true at the same time as RequeueAfter.
+	RequeueAfter time.Duration
 }
 
 // Request contains the information necessary to reconcile a Kubernetes object.  This includes the
@@ -46,7 +52,7 @@ Deleting Kubernetes objects) or external Events (GitHub Webhooks, polling extern
 
 Example reconcile Logic:
 
-	* Reader an object and all the Pods it owns.
+	* Read an object and all the Pods it owns.
 	* Observe that the object spec specifies 5 replicas but actual cluster contains only 1 Pod replica.
 	* Create 4 Pods and set their OwnerReferences to the object.
 

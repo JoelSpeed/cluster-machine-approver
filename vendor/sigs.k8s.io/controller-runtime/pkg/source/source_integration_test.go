@@ -17,7 +17,9 @@ limitations under the License.
 package source_test
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -30,6 +32,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	kubeinformers "k8s.io/client-go/informers"
+	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -40,14 +44,15 @@ var _ = Describe("Source", func() {
 	var c1, c2 chan interface{}
 	var ns string
 	count := 0
+	ctx := context.TODO()
 
 	BeforeEach(func(done Done) {
 		// Create the namespace for the test
 		ns = fmt.Sprintf("controller-source-kindsource-%v", count)
 		count++
-		_, err := clientset.CoreV1().Namespaces().Create(&corev1.Namespace{
+		_, err := clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
-		})
+		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		q = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
@@ -59,14 +64,14 @@ var _ = Describe("Source", func() {
 
 	JustBeforeEach(func() {
 		instance1 = &source.Kind{Type: obj}
-		inject.CacheInto(icache, instance1)
+		Expect(inject.CacheInto(icache, instance1)).To(BeTrue())
 
 		instance2 = &source.Kind{Type: obj}
-		inject.CacheInto(icache, instance2)
+		Expect(inject.CacheInto(icache, instance2)).To(BeTrue())
 	})
 
 	AfterEach(func(done Done) {
-		err := clientset.CoreV1().Namespaces().Delete(ns, &metav1.DeleteOptions{})
+		err := clientset.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		close(c1)
 		close(c2)
@@ -128,11 +133,11 @@ var _ = Describe("Source", func() {
 				handler2 := newHandler(c2)
 
 				// Create 2 instances
-				instance1.Start(handler1, q)
-				instance2.Start(handler2, q)
+				Expect(instance1.Start(handler1, q)).To(Succeed())
+				Expect(instance2.Start(handler2, q)).To(Succeed())
 
 				By("Creating a Deployment and expecting the CreateEvent.")
-				created, err = client.Create(deployment)
+				created, err = client.Create(ctx, deployment, metav1.CreateOptions{})
 				Expect(err).NotTo(HaveOccurred())
 				Expect(created).NotTo(BeNil())
 
@@ -153,7 +158,7 @@ var _ = Describe("Source", func() {
 				By("Updating a Deployment and expecting the UpdateEvent.")
 				updated = created.DeepCopy()
 				updated.Labels = map[string]string{"biz": "buz"}
-				updated, err = client.Update(updated)
+				updated, err = client.Update(ctx, updated, metav1.UpdateOptions{})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Check first UpdateEvent
@@ -180,7 +185,7 @@ var _ = Describe("Source", func() {
 
 				By("Deleting a Deployment and expecting the Delete.")
 				deleted = updated.DeepCopy()
-				err = client.Delete(created.Name, &metav1.DeleteOptions{})
+				err = client.Delete(ctx, created.Name, metav1.DeleteOptions{})
 				Expect(err).NotTo(HaveOccurred())
 
 				deleted.SetResourceVersion("")
@@ -203,9 +208,166 @@ var _ = Describe("Source", func() {
 		})
 
 		// TODO(pwittrock): Write this test
-		Context("for a Foo CRD resource", func() {
+		PContext("for a Foo CRD resource", func() {
 			It("should provide Foo Events", func() {
 
+			})
+		})
+	})
+
+	Describe("Informer", func() {
+		var c chan struct{}
+		var rs *appsv1.ReplicaSet
+		var depInformer toolscache.SharedIndexInformer
+		var informerFactory kubeinformers.SharedInformerFactory
+		var stopTest chan struct{}
+
+		BeforeEach(func(done Done) {
+			stopTest = make(chan struct{})
+			informerFactory = kubeinformers.NewSharedInformerFactory(clientset, time.Second*30)
+			depInformer = informerFactory.Apps().V1().ReplicaSets().Informer()
+			informerFactory.Start(stopTest)
+			Eventually(depInformer.HasSynced).Should(BeTrue())
+
+			c = make(chan struct{})
+			rs = &appsv1.ReplicaSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "informer-rs-name"},
+				Spec: appsv1.ReplicaSetSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"foo": "bar"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"foo": "bar"}},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "nginx",
+									Image: "nginx",
+								},
+							},
+						},
+					},
+				},
+			}
+			close(done)
+		})
+
+		AfterEach(func(done Done) {
+			close(stopTest)
+			close(done)
+		})
+
+		Context("for a ReplicaSet resource", func() {
+			It("should provide a ReplicaSet CreateEvent", func(done Done) {
+				c := make(chan struct{})
+
+				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
+				instance := &source.Informer{Informer: depInformer}
+				err := instance.Start(handler.Funcs{
+					CreateFunc: func(evt event.CreateEvent, q2 workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						var err error
+						rs, err := clientset.AppsV1().ReplicaSets("default").Get(ctx, rs.Name, metav1.GetOptions{})
+						Expect(err).NotTo(HaveOccurred())
+
+						Expect(q2).To(BeIdenticalTo(q))
+						Expect(evt.Meta).To(Equal(rs))
+						Expect(evt.Object).To(Equal(rs))
+						close(c)
+					},
+					UpdateFunc: func(event.UpdateEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected UpdateEvent")
+					},
+					DeleteFunc: func(event.DeleteEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected DeleteEvent")
+					},
+					GenericFunc: func(event.GenericEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected GenericEvent")
+					},
+				}, q)
+				Expect(err).NotTo(HaveOccurred())
+
+				_, err = clientset.AppsV1().ReplicaSets("default").Create(ctx, rs, metav1.CreateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				<-c
+				close(done)
+			}, 30)
+
+			It("should provide a ReplicaSet UpdateEvent", func(done Done) {
+				var err error
+				rs, err = clientset.AppsV1().ReplicaSets("default").Get(ctx, rs.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+
+				rs2 := rs.DeepCopy()
+				rs2.SetLabels(map[string]string{"biz": "baz"})
+
+				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
+				instance := &source.Informer{Informer: depInformer}
+				err = instance.Start(handler.Funcs{
+					CreateFunc: func(evt event.CreateEvent, q2 workqueue.RateLimitingInterface) {
+					},
+					UpdateFunc: func(evt event.UpdateEvent, q2 workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						var err error
+						rs2, err := clientset.AppsV1().ReplicaSets("default").Get(ctx, rs.Name, metav1.GetOptions{})
+						Expect(err).NotTo(HaveOccurred())
+
+						Expect(q2).To(Equal(q))
+						Expect(evt.MetaOld).To(Equal(rs))
+						Expect(evt.ObjectOld).To(Equal(rs))
+
+						Expect(evt.MetaNew).To(Equal(rs2))
+						Expect(evt.ObjectNew).To(Equal(rs2))
+
+						close(c)
+					},
+					DeleteFunc: func(event.DeleteEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected DeleteEvent")
+					},
+					GenericFunc: func(event.GenericEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected GenericEvent")
+					},
+				}, q)
+				Expect(err).NotTo(HaveOccurred())
+
+				_, err = clientset.AppsV1().ReplicaSets("default").Update(ctx, rs2, metav1.UpdateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				<-c
+				close(done)
+			})
+
+			It("should provide a ReplicaSet DeletedEvent", func(done Done) {
+				c := make(chan struct{})
+
+				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
+				instance := &source.Informer{Informer: depInformer}
+				err := instance.Start(handler.Funcs{
+					CreateFunc: func(event.CreateEvent, workqueue.RateLimitingInterface) {
+					},
+					UpdateFunc: func(event.UpdateEvent, workqueue.RateLimitingInterface) {
+					},
+					DeleteFunc: func(evt event.DeleteEvent, q2 workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Expect(q2).To(Equal(q))
+						Expect(evt.Meta.GetName()).To(Equal(rs.Name))
+						close(c)
+					},
+					GenericFunc: func(event.GenericEvent, workqueue.RateLimitingInterface) {
+						defer GinkgoRecover()
+						Fail("Unexpected GenericEvent")
+					},
+				}, q)
+				Expect(err).NotTo(HaveOccurred())
+
+				err = clientset.AppsV1().ReplicaSets("default").Delete(ctx, rs.Name, metav1.DeleteOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				<-c
+				close(done)
 			})
 		})
 	})

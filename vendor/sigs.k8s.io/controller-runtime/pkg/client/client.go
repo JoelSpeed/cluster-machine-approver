@@ -19,10 +19,11 @@ package client
 import (
 	"context"
 	"fmt"
-	"reflect"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -39,6 +40,15 @@ type Options struct {
 }
 
 // New returns a new Client using the provided config and Options.
+// The returned client reads *and* writes directly from the server
+// (it doesn't use object caches).  It understands how to work with
+// normal types (both custom resources and aggregated/built-in resources),
+// as well as unstructured types.
+//
+// In the case of normal types, the scheme will be used to look up the
+// corresponding group, version, and kind for the given type.  In the
+// case of unstructured types, the group, version, and kind will be extracted
+// from the corresponding fields on the object.
 func New(config *rest.Config, options Options) (Client, error) {
 	if config == nil {
 		return nil, fmt.Errorf("must provide non-nil rest.Config to client.New")
@@ -52,21 +62,29 @@ func New(config *rest.Config, options Options) (Client, error) {
 	// Init a Mapper if none provided
 	if options.Mapper == nil {
 		var err error
-		options.Mapper, err = apiutil.NewDiscoveryRESTMapper(config)
+		options.Mapper, err = apiutil.NewDynamicRESTMapper(config)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	clientcache := &clientCache{
+		config:         config,
+		scheme:         options.Scheme,
+		mapper:         options.Mapper,
+		codecs:         serializer.NewCodecFactory(options.Scheme),
+		resourceByType: make(map[schema.GroupVersionKind]*resourceMeta),
+	}
+
 	c := &client{
-		cache: clientCache{
-			config:         config,
-			scheme:         options.Scheme,
-			mapper:         options.Mapper,
-			codecs:         serializer.NewCodecFactory(options.Scheme),
-			resourceByType: make(map[reflect.Type]*resourceMeta),
+		typedClient: typedClient{
+			cache:      clientcache,
+			paramCodec: runtime.NewParameterCodec(options.Scheme),
 		},
-		paramCodec: runtime.NewParameterCodec(options.Scheme),
+		unstructuredClient: unstructuredClient{
+			cache:      clientcache,
+			paramCodec: noConversionParamCodec{},
+		},
 	}
 
 	return c, nil
@@ -77,82 +95,83 @@ var _ Client = &client{}
 // client is a client.Client that reads and writes directly from/to an API server.  It lazily initializes
 // new clients at the time they are used, and caches the client.
 type client struct {
-	cache      clientCache
-	paramCodec runtime.ParameterCodec
+	typedClient        typedClient
+	unstructuredClient unstructuredClient
+}
+
+// resetGroupVersionKind is a helper function to restore and preserve GroupVersionKind on an object.
+// TODO(vincepri): Remove this function and its calls once controller-runtime dependencies are upgraded to 1.16?
+func (c *client) resetGroupVersionKind(obj runtime.Object, gvk schema.GroupVersionKind) {
+	if gvk != schema.EmptyObjectKind.GroupVersionKind() {
+		if v, ok := obj.(schema.ObjectKind); ok {
+			v.SetGroupVersionKind(gvk)
+		}
+	}
 }
 
 // Create implements client.Client
-func (c *client) Create(ctx context.Context, obj runtime.Object) error {
-	o, err := c.cache.getObjMeta(obj)
-	if err != nil {
-		return err
+func (c *client) Create(ctx context.Context, obj runtime.Object, opts ...CreateOption) error {
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.Create(ctx, obj, opts...)
 	}
-	return o.Post().
-		NamespaceIfScoped(o.GetNamespace(), o.isNamespaced()).
-		Resource(o.resource()).
-		Body(obj).
-		Do().
-		Into(obj)
+	return c.typedClient.Create(ctx, obj, opts...)
 }
 
 // Update implements client.Client
-func (c *client) Update(ctx context.Context, obj runtime.Object) error {
-	o, err := c.cache.getObjMeta(obj)
-	if err != nil {
-		return err
+func (c *client) Update(ctx context.Context, obj runtime.Object, opts ...UpdateOption) error {
+	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.Update(ctx, obj, opts...)
 	}
-	return o.Put().
-		NamespaceIfScoped(o.GetNamespace(), o.isNamespaced()).
-		Resource(o.resource()).
-		Name(o.GetName()).
-		Body(obj).
-		Do().
-		Into(obj)
+	return c.typedClient.Update(ctx, obj, opts...)
 }
 
 // Delete implements client.Client
-func (c *client) Delete(ctx context.Context, obj runtime.Object) error {
-	o, err := c.cache.getObjMeta(obj)
-	if err != nil {
-		return err
+func (c *client) Delete(ctx context.Context, obj runtime.Object, opts ...DeleteOption) error {
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.Delete(ctx, obj, opts...)
 	}
-	return o.Delete().
-		NamespaceIfScoped(o.GetNamespace(), o.isNamespaced()).
-		Resource(o.resource()).
-		Name(o.GetName()).
-		Do().
-		Error()
+	return c.typedClient.Delete(ctx, obj, opts...)
+}
+
+// DeleteAllOf implements client.Client
+func (c *client) DeleteAllOf(ctx context.Context, obj runtime.Object, opts ...DeleteAllOfOption) error {
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.DeleteAllOf(ctx, obj, opts...)
+	}
+	return c.typedClient.DeleteAllOf(ctx, obj, opts...)
+}
+
+// Patch implements client.Client
+func (c *client) Patch(ctx context.Context, obj runtime.Object, patch Patch, opts ...PatchOption) error {
+	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.Patch(ctx, obj, patch, opts...)
+	}
+	return c.typedClient.Patch(ctx, obj, patch, opts...)
 }
 
 // Get implements client.Client
 func (c *client) Get(ctx context.Context, key ObjectKey, obj runtime.Object) error {
-	r, err := c.cache.getResource(obj)
-	if err != nil {
-		return err
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return c.unstructuredClient.Get(ctx, key, obj)
 	}
-	return r.Get().
-		NamespaceIfScoped(key.Namespace, r.isNamespaced()).
-		Resource(r.resource()).
-		Name(key.Name).Do().Into(obj)
+	return c.typedClient.Get(ctx, key, obj)
 }
 
 // List implements client.Client
-func (c *client) List(ctx context.Context, opts *ListOptions, obj runtime.Object) error {
-	r, err := c.cache.getResource(obj)
-	if err != nil {
-		return err
+func (c *client) List(ctx context.Context, obj runtime.Object, opts ...ListOption) error {
+	_, ok := obj.(*unstructured.UnstructuredList)
+	if ok {
+		return c.unstructuredClient.List(ctx, obj, opts...)
 	}
-	namespace := ""
-	if opts != nil {
-		namespace = opts.Namespace
-	}
-	return r.Get().
-		NamespaceIfScoped(namespace, r.isNamespaced()).
-		Resource(r.resource()).
-		Body(obj).
-		VersionedParams(opts.AsListOptions(), c.paramCodec).
-		Do().
-		Into(obj)
+	return c.typedClient.List(ctx, obj, opts...)
 }
 
 // Status implements client.StatusClient
@@ -169,21 +188,21 @@ type statusWriter struct {
 var _ StatusWriter = &statusWriter{}
 
 // Update implements client.StatusWriter
-func (sw *statusWriter) Update(_ context.Context, obj runtime.Object) error {
-	o, err := sw.client.cache.getObjMeta(obj)
-	if err != nil {
-		return err
+func (sw *statusWriter) Update(ctx context.Context, obj runtime.Object, opts ...UpdateOption) error {
+	defer sw.client.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return sw.client.unstructuredClient.UpdateStatus(ctx, obj, opts...)
 	}
-	// TODO(droot): examine the returned error and check if it error needs to be
-	// wrapped to improve the UX ?
-	// It will be nice to receive an error saying the object doesn't implement
-	// status subresource and check CRD definition
-	return o.Put().
-		NamespaceIfScoped(o.GetNamespace(), o.isNamespaced()).
-		Resource(o.resource()).
-		Name(o.GetName()).
-		SubResource("status").
-		Body(obj).
-		Do().
-		Into(obj)
+	return sw.client.typedClient.UpdateStatus(ctx, obj, opts...)
+}
+
+// Patch implements client.Client
+func (sw *statusWriter) Patch(ctx context.Context, obj runtime.Object, patch Patch, opts ...PatchOption) error {
+	defer sw.client.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
+	_, ok := obj.(*unstructured.Unstructured)
+	if ok {
+		return sw.client.unstructuredClient.PatchStatus(ctx, obj, patch, opts...)
+	}
+	return sw.client.typedClient.PatchStatus(ctx, obj, patch, opts...)
 }

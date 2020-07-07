@@ -97,7 +97,6 @@ func newTestServer(handler func(w http.ResponseWriter, r *http.Request)) (*httpt
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    rootCAs}
 	testServer.TLS.Certificates[0] = serverCertificate
-	testServer.TLS.BuildNameToCertificate()
 
 	testServer.StartTLS()
 
@@ -327,13 +326,19 @@ func TestBearerAuthRoundTripper(t *testing.T) {
 	bearerAuthRoundTripper := NewBearerAuthRoundTripper(BearerToken, fakeRoundTripper)
 	request, _ := http.NewRequest("GET", "/hitchhiker", nil)
 	request.Header.Set("User-Agent", "Douglas Adams mind")
-	bearerAuthRoundTripper.RoundTrip(request)
+	_, err := bearerAuthRoundTripper.RoundTrip(request)
+	if err != nil {
+		t.Errorf("unexpected error while executing RoundTrip: %s", err.Error())
+	}
 
 	// Should honor already Authorization header set.
 	bearerAuthRoundTripperShouldNotModifyExistingAuthorization := NewBearerAuthRoundTripper(newBearerToken, fakeRoundTripper)
 	request, _ = http.NewRequest("GET", "/hitchhiker", nil)
 	request.Header.Set("Authorization", ExpectedBearer)
-	bearerAuthRoundTripperShouldNotModifyExistingAuthorization.RoundTrip(request)
+	_, err = bearerAuthRoundTripperShouldNotModifyExistingAuthorization.RoundTrip(request)
+	if err != nil {
+		t.Errorf("unexpected error while executing RoundTrip: %s", err.Error())
+	}
 }
 
 func TestBearerAuthFileRoundTripper(t *testing.T) {
@@ -349,13 +354,19 @@ func TestBearerAuthFileRoundTripper(t *testing.T) {
 	bearerAuthRoundTripper := NewBearerAuthFileRoundTripper(BearerTokenFile, fakeRoundTripper)
 	request, _ := http.NewRequest("GET", "/hitchhiker", nil)
 	request.Header.Set("User-Agent", "Douglas Adams mind")
-	bearerAuthRoundTripper.RoundTrip(request)
+	_, err := bearerAuthRoundTripper.RoundTrip(request)
+	if err != nil {
+		t.Errorf("unexpected error while executing RoundTrip: %s", err.Error())
+	}
 
 	// Should honor already Authorization header set.
 	bearerAuthRoundTripperShouldNotModifyExistingAuthorization := NewBearerAuthFileRoundTripper(MissingBearerTokenFile, fakeRoundTripper)
 	request, _ = http.NewRequest("GET", "/hitchhiker", nil)
 	request.Header.Set("Authorization", ExpectedBearer)
-	bearerAuthRoundTripperShouldNotModifyExistingAuthorization.RoundTrip(request)
+	_, err = bearerAuthRoundTripperShouldNotModifyExistingAuthorization.RoundTrip(request)
+	if err != nil {
+		t.Errorf("unexpected error while executing RoundTrip: %s", err.Error())
+	}
 }
 
 func TestTLSConfig(t *testing.T) {

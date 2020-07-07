@@ -18,6 +18,7 @@ package reconcile_test
 
 import (
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -25,7 +26,6 @@ import (
 
 // This example implements a simple no-op reconcile function that prints the object to be Reconciled.
 func ExampleFunc() {
-	type Reconciler struct{}
 
 	r := reconcile.Func(func(o reconcile.Request) (reconcile.Result, error) {
 		// Create your business logic to create, update, delete objects here.
@@ -33,7 +33,10 @@ func ExampleFunc() {
 		return reconcile.Result{}, nil
 	})
 
-	r.Reconcile(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"}})
+	res, err := r.Reconcile(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"}})
+	if err != nil || res.Requeue || res.RequeueAfter != time.Duration(0) {
+		fmt.Printf("got requeue request: %v, %v\n", err, res)
+	}
 
 	// Output: Name: test, Namespace: default
 }

@@ -67,7 +67,7 @@ var _ = Describe("Source", func() {
 				instance := &source.Kind{
 					Type: &corev1.Pod{},
 				}
-				inject.CacheInto(ic, instance)
+				Expect(inject.CacheInto(ic, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(evt event.CreateEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -108,7 +108,7 @@ var _ = Describe("Source", func() {
 				instance := &source.Kind{
 					Type: &corev1.Pod{},
 				}
-				instance.InjectCache(ic)
+				Expect(instance.InjectCache(ic)).To(Succeed())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(evt event.CreateEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -116,7 +116,7 @@ var _ = Describe("Source", func() {
 					},
 					UpdateFunc: func(evt event.UpdateEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
-						Expect(q2).To(Equal(q))
+						Expect(q2).To(BeIdenticalTo(q))
 						Expect(evt.MetaOld).To(Equal(p))
 						Expect(evt.ObjectOld).To(Equal(p))
 
@@ -158,7 +158,7 @@ var _ = Describe("Source", func() {
 				instance := &source.Kind{
 					Type: &corev1.Pod{},
 				}
-				inject.CacheInto(ic, instance)
+				Expect(inject.CacheInto(ic, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(event.CreateEvent, workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -170,7 +170,7 @@ var _ = Describe("Source", func() {
 					},
 					DeleteFunc: func(evt event.DeleteEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
-						Expect(q2).To(Equal(q))
+						Expect(q2).To(BeIdenticalTo(q))
 						Expect(evt.Meta).To(Equal(p))
 						Expect(evt.Object).To(Equal(p))
 						close(c)
@@ -202,12 +202,24 @@ var _ = Describe("Source", func() {
 
 		It("should return an error from Start if a type was not provided", func(done Done) {
 			instance := source.Kind{}
-			instance.InjectCache(&informertest.FakeInformers{})
+			Expect(instance.InjectCache(&informertest.FakeInformers{})).To(Succeed())
 			err := instance.Start(nil, nil)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("must specify Kind.Type"))
 
 			close(done)
+		})
+
+		It("should return an error if syncing fails", func(done Done) {
+			instance := source.Kind{}
+			f := false
+			Expect(instance.InjectCache(&informertest.FakeInformers{Synced: &f})).To(Succeed())
+			err := instance.WaitForSync(nil)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(Equal("cache did not sync"))
+
+			close(done)
+
 		})
 
 		Context("for a Kind not in the cache", func() {
@@ -218,12 +230,32 @@ var _ = Describe("Source", func() {
 				instance := &source.Kind{
 					Type: &corev1.Pod{},
 				}
-				instance.InjectCache(ic)
+				Expect(instance.InjectCache(ic)).To(Succeed())
 				err := instance.Start(handler.Funcs{}, q)
 				Expect(err).To(HaveOccurred())
 
 				close(done)
 			})
+		})
+	})
+
+	Describe("KindWithCache", func() {
+		It("should not allow injecting a cache", func() {
+			instance := source.NewKindWithCache(nil, nil)
+			injected, err := inject.CacheInto(&informertest.FakeInformers{}, instance)
+			Expect(err).To(BeNil())
+			Expect(injected).To(BeFalse())
+		})
+
+		It("should return an error if syncing fails", func(done Done) {
+			f := false
+			instance := source.NewKindWithCache(nil, &informertest.FakeInformers{Synced: &f})
+			err := instance.WaitForSync(nil)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(Equal("cache did not sync"))
+
+			close(done)
+
 		})
 	})
 
@@ -288,7 +320,7 @@ var _ = Describe("Source", func() {
 
 				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
 				instance := &source.Channel{Source: ch}
-				inject.StopChannelInto(stop, instance)
+				Expect(inject.StopChannelInto(stop, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(event.CreateEvent, workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -306,7 +338,7 @@ var _ = Describe("Source", func() {
 						defer GinkgoRecover()
 						// The empty event should have been filtered out by the predicates,
 						// and will not be passed to the handler.
-						Expect(q2).To(Equal(q))
+						Expect(q2).To(BeIdenticalTo(q))
 						Expect(evt.Meta).To(Equal(p))
 						Expect(evt.Object).To(Equal(p))
 						close(c)
@@ -330,7 +362,7 @@ var _ = Describe("Source", func() {
 				// Add a handler to get distribution blocked
 				instance := &source.Channel{Source: ch}
 				instance.DestBufferSize = 1
-				inject.StopChannelInto(stop, instance)
+				Expect(inject.StopChannelInto(stop, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(event.CreateEvent, workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -350,7 +382,7 @@ var _ = Describe("Source", func() {
 						if eventCount == 0 {
 							<-unblock
 						}
-						eventCount += 1
+						eventCount++
 
 						if eventCount == 3 {
 							close(processed)
@@ -382,7 +414,7 @@ var _ = Describe("Source", func() {
 			It("should get error if no source specified", func(done Done) {
 				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
 				instance := &source.Channel{ /*no source specified*/ }
-				inject.StopChannelInto(stop, instance)
+				Expect(inject.StopChannelInto(stop, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{}, q)
 				Expect(err).To(Equal(fmt.Errorf("must specify Channel.Source")))
 				close(done)
@@ -413,7 +445,7 @@ var _ = Describe("Source", func() {
 
 				q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test")
 				instance := &source.Channel{Source: ch}
-				inject.StopChannelInto(stop, instance)
+				Expect(inject.StopChannelInto(stop, instance)).To(BeTrue())
 				err := instance.Start(handler.Funcs{
 					CreateFunc: func(event.CreateEvent, workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
@@ -429,7 +461,7 @@ var _ = Describe("Source", func() {
 					},
 					GenericFunc: func(evt event.GenericEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
-						Expect(q2).To(Equal(q))
+						Expect(q2).To(BeIdenticalTo(q))
 						Expect(evt.Meta).To(Equal(p))
 						Expect(evt.Object).To(Equal(p))
 						resEvent1 = evt
@@ -453,7 +485,7 @@ var _ = Describe("Source", func() {
 					},
 					GenericFunc: func(evt event.GenericEvent, q2 workqueue.RateLimitingInterface) {
 						defer GinkgoRecover()
-						Expect(q2).To(Equal(q))
+						Expect(q2).To(BeIdenticalTo(q))
 						Expect(evt.Meta).To(Equal(p))
 						Expect(evt.Object).To(Equal(p))
 						resEvent2 = evt

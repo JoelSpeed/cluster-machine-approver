@@ -24,13 +24,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 func TestSource(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecsWithDefaultAndCustomReporters(t, "Controller Integration Suite", []Reporter{envtest.NewlineReporter{}})
+	RunSpecsWithDefaultAndCustomReporters(t, "Controller Integration Suite", []Reporter{printer.NewlineReporter{}})
 }
 
 var testenv *envtest.Environment
@@ -38,7 +40,7 @@ var cfg *rest.Config
 var clientset *kubernetes.Clientset
 
 var _ = BeforeSuite(func(done Done) {
-	logf.SetLogger(logf.ZapLoggerTo(GinkgoWriter, true))
+	logf.SetLogger(zap.LoggerTo(GinkgoWriter, true))
 
 	testenv = &envtest.Environment{}
 
@@ -53,5 +55,5 @@ var _ = BeforeSuite(func(done Done) {
 }, 60)
 
 var _ = AfterSuite(func() {
-	testenv.Stop()
+	Expect(testenv.Stop()).To(Succeed())
 })

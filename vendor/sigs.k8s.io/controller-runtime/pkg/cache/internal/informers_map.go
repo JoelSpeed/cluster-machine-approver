@@ -17,34 +17,48 @@ limitations under the License.
 package internal
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
-// NewInformersMap returns a new InformersMap
-func NewInformersMap(config *rest.Config,
+// clientListWatcherFunc knows how to create a ListWatcher
+type createListWatcherFunc func(gvk schema.GroupVersionKind, ip *specificInformersMap) (*cache.ListWatch, error)
+
+// newSpecificInformersMap returns a new specificInformersMap (like
+// the generical InformersMap, except that it doesn't implement WaitForCacheSync).
+func newSpecificInformersMap(config *rest.Config,
 	scheme *runtime.Scheme,
 	mapper meta.RESTMapper,
-	resync time.Duration) *InformersMap {
-	ip := &InformersMap{
-		config:         config,
-		Scheme:         scheme,
-		mapper:         mapper,
-		informersByGVK: make(map[schema.GroupVersionKind]*MapEntry),
-		codecs:         serializer.NewCodecFactory(scheme),
-		paramCodec:     runtime.NewParameterCodec(scheme),
-		resync:         resync,
+	resync time.Duration,
+	namespace string,
+	createListWatcher createListWatcherFunc) *specificInformersMap {
+	ip := &specificInformersMap{
+		config:            config,
+		Scheme:            scheme,
+		mapper:            mapper,
+		informersByGVK:    make(map[schema.GroupVersionKind]*MapEntry),
+		codecs:            serializer.NewCodecFactory(scheme),
+		paramCodec:        runtime.NewParameterCodec(scheme),
+		resync:            resync,
+		startWait:         make(chan struct{}),
+		createListWatcher: createListWatcher,
+		namespace:         namespace,
 	}
 	return ip
 }
@@ -58,9 +72,9 @@ type MapEntry struct {
 	Reader CacheReader
 }
 
-// InformersMap create and caches Informers for (runtime.Object, schema.GroupVersionKind) pairs.
-//It uses a standard parameter codec constructed based on the given generated Scheme.
-type InformersMap struct {
+// specificInformersMap create and caches Informers for (runtime.Object, schema.GroupVersionKind) pairs.
+// It uses a standard parameter codec constructed based on the given generated Scheme.
+type specificInformersMap struct {
 	// Scheme maps runtime.Objects to GroupVersionKinds
 	Scheme *runtime.Scheme
 
@@ -82,7 +96,9 @@ type InformersMap struct {
 	// stop is the stop channel to stop informers
 	stop <-chan struct{}
 
-	// resync is the frequency the informers are resynced
+	// resync is the base frequency the informers are resynced
+	// a 10 percent jitter will be added to the resync period between informers
+	// so that all informers will not send list requests simultaneously.
 	resync time.Duration
 
 	// mu guards access to the map
@@ -90,10 +106,24 @@ type InformersMap struct {
 
 	// start is true if the informers have been started
 	started bool
+
+	// startWait is a channel that is closed after the
+	// informer has been started.
+	startWait chan struct{}
+
+	// createClient knows how to create a client and a list object,
+	// and allows for abstracting over the particulars of structured vs
+	// unstructured objects.
+	createListWatcher createListWatcherFunc
+
+	// namespace is the namespace that all ListWatches are restricted to
+	// default or empty string means all namespaces
+	namespace string
 }
 
 // Start calls Run on each of the informers and sets started to true.  Blocks on the stop channel.
-func (ip *InformersMap) Start(stop <-chan struct{}) error {
+// It doesn't return start because it can't return an error, and it's not a runnable directly.
+func (ip *specificInformersMap) Start(stop <-chan struct{}) {
 	func() {
 		ip.mu.Lock()
 		defer ip.mu.Unlock()
@@ -108,97 +138,96 @@ func (ip *InformersMap) Start(stop <-chan struct{}) error {
 
 		// Set started to true so we immediately start any informers added later.
 		ip.started = true
+		close(ip.startWait)
 	}()
 	<-stop
-	return nil
 }
 
-// WaitForCacheSync waits until all the caches have been synced
-func (ip *InformersMap) WaitForCacheSync(stop <-chan struct{}) bool {
+func (ip *specificInformersMap) waitForStarted(stop <-chan struct{}) bool {
+	select {
+	case <-ip.startWait:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// HasSyncedFuncs returns all the HasSynced functions for the informers in this map.
+func (ip *specificInformersMap) HasSyncedFuncs() []cache.InformerSynced {
+	ip.mu.RLock()
+	defer ip.mu.RUnlock()
 	syncedFuncs := make([]cache.InformerSynced, 0, len(ip.informersByGVK))
 	for _, informer := range ip.informersByGVK {
 		syncedFuncs = append(syncedFuncs, informer.Informer.HasSynced)
 	}
-	return cache.WaitForCacheSync(stop, syncedFuncs...)
+	return syncedFuncs
 }
 
-// Get will create a new Informer and add it to the map of InformersMap if none exists.  Returns
+// Get will create a new Informer and add it to the map of specificInformersMap if none exists.  Returns
 // the Informer from the map.
-func (ip *InformersMap) Get(gvk schema.GroupVersionKind, obj runtime.Object) (*MapEntry, error) {
+func (ip *specificInformersMap) Get(ctx context.Context, gvk schema.GroupVersionKind, obj runtime.Object) (bool, *MapEntry, error) {
 	// Return the informer if it is found
-	i, ok := func() (*MapEntry, bool) {
+	i, started, ok := func() (*MapEntry, bool, bool) {
 		ip.mu.RLock()
 		defer ip.mu.RUnlock()
 		i, ok := ip.informersByGVK[gvk]
-		return i, ok
+		return i, ip.started, ok
 	}()
-	if ok {
-		return i, nil
+
+	if !ok {
+		var err error
+		if i, started, err = ip.addInformerToMap(gvk, obj); err != nil {
+			return started, nil, err
+		}
 	}
 
-	// Do the mutex part in its own function so we can use defer without blocking pieces that don't
-	// need to be locked
-	var sync bool
-	i, err := func() (*MapEntry, error) {
-		ip.mu.Lock()
-		defer ip.mu.Unlock()
-
-		// Check the cache to see if we already have an Informer.  If we do, return the Informer.
-		// This is for the case where 2 routines tried to get the informer when it wasn't in the map
-		// so neither returned early, but the first one created it.
-		var ok bool
-		i, ok := ip.informersByGVK[gvk]
-		if ok {
-			return i, nil
-		}
-
-		// Create a NewSharedIndexInformer and add it to the map.
-		var lw *cache.ListWatch
-		lw, err := ip.newListWatch(gvk)
-		if err != nil {
-			return nil, err
-		}
-		ni := cache.NewSharedIndexInformer(lw, obj, ip.resync, cache.Indexers{
-			cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
-		})
-		i = &MapEntry{
-			Informer: ni,
-			Reader:   CacheReader{indexer: ni.GetIndexer(), groupVersionKind: gvk},
-		}
-		ip.informersByGVK[gvk] = i
-
-		// Start the Informer if need by
-		// TODO(seans): write thorough tests and document what happens here - can you add indexers?
-		// can you add eventhandlers?
-		if ip.started {
-			sync = true
-			go i.Informer.Run(ip.stop)
-		}
-		return i, nil
-	}()
-	if err != nil {
-		return nil, err
-	}
-
-	if sync {
+	if started && !i.Informer.HasSynced() {
 		// Wait for it to sync before returning the Informer so that folks don't read from a stale cache.
-		if !cache.WaitForCacheSync(ip.stop, i.Informer.HasSynced) {
-			return nil, fmt.Errorf("failed waiting for %T Informer to sync", obj)
+		if !cache.WaitForCacheSync(ctx.Done(), i.Informer.HasSynced) {
+			return started, nil, apierrors.NewTimeoutError(fmt.Sprintf("failed waiting for %T Informer to sync", obj), 0)
 		}
 	}
 
-	return i, err
+	return started, i, nil
+}
+
+func (ip *specificInformersMap) addInformerToMap(gvk schema.GroupVersionKind, obj runtime.Object) (*MapEntry, bool, error) {
+	ip.mu.Lock()
+	defer ip.mu.Unlock()
+
+	// Check the cache to see if we already have an Informer.  If we do, return the Informer.
+	// This is for the case where 2 routines tried to get the informer when it wasn't in the map
+	// so neither returned early, but the first one created it.
+	if i, ok := ip.informersByGVK[gvk]; ok {
+		return i, ip.started, nil
+	}
+
+	// Create a NewSharedIndexInformer and add it to the map.
+	var lw *cache.ListWatch
+	lw, err := ip.createListWatcher(gvk, ip)
+	if err != nil {
+		return nil, false, err
+	}
+	ni := cache.NewSharedIndexInformer(lw, obj, resyncPeriod(ip.resync)(), cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	i := &MapEntry{
+		Informer: ni,
+		Reader:   CacheReader{indexer: ni.GetIndexer(), groupVersionKind: gvk},
+	}
+	ip.informersByGVK[gvk] = i
+
+	// Start the Informer if need by
+	// TODO(seans): write thorough tests and document what happens here - can you add indexers?
+	// can you add eventhandlers?
+	if ip.started {
+		go i.Informer.Run(ip.stop)
+	}
+	return i, ip.started, nil
 }
 
 // newListWatch returns a new ListWatch object that can be used to create a SharedIndexInformer.
-func (ip *InformersMap) newListWatch(gvk schema.GroupVersionKind) (*cache.ListWatch, error) {
-	// Construct a RESTClient for the groupVersionKind that we will use to
-	// talk to the apiserver.
-	client, err := apiutil.RESTClientForGVK(gvk, ip.config, ip.codecs)
-	if err != nil {
-		return nil, err
-	}
-
+func createStructuredListWatch(gvk schema.GroupVersionKind, ip *specificInformersMap) (*cache.ListWatch, error) {
 	// Kubernetes APIs work against Resources, not GroupVersionKinds.  Map the
 	// groupVersionKind to the Resource API we will use.
 	mapping, err := ip.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
@@ -206,25 +235,79 @@ func (ip *InformersMap) newListWatch(gvk schema.GroupVersionKind) (*cache.ListWa
 		return nil, err
 	}
 
-	// Get a listObject for listing that the ListWatch can DeepCopy
+	client, err := apiutil.RESTClientForGVK(gvk, ip.config, ip.codecs)
+	if err != nil {
+		return nil, err
+	}
 	listGVK := gvk.GroupVersion().WithKind(gvk.Kind + "List")
 	listObj, err := ip.Scheme.New(listGVK)
 	if err != nil {
 		return nil, err
 	}
 
+	// TODO: the functions that make use of this ListWatch should be adapted to
+	//  pass in their own contexts instead of relying on this fixed one here.
+	ctx := context.TODO()
 	// Create a new ListWatch for the obj
 	return &cache.ListWatch{
 		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 			res := listObj.DeepCopyObject()
-			err := client.Get().Resource(mapping.Resource).VersionedParams(&opts, ip.paramCodec).Do().Into(res)
+			isNamespaceScoped := ip.namespace != "" && mapping.Scope.Name() != meta.RESTScopeNameRoot
+			err := client.Get().NamespaceIfScoped(ip.namespace, isNamespaceScoped).Resource(mapping.Resource.Resource).VersionedParams(&opts, ip.paramCodec).Do(ctx).Into(res)
 			return res, err
 		},
 		// Setup the watch function
 		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 			// Watch needs to be set to true separately
 			opts.Watch = true
-			return client.Get().Resource(mapping.Resource).VersionedParams(&opts, ip.paramCodec).Watch()
+			isNamespaceScoped := ip.namespace != "" && mapping.Scope.Name() != meta.RESTScopeNameRoot
+			return client.Get().NamespaceIfScoped(ip.namespace, isNamespaceScoped).Resource(mapping.Resource.Resource).VersionedParams(&opts, ip.paramCodec).Watch(ctx)
 		},
 	}, nil
+}
+
+func createUnstructuredListWatch(gvk schema.GroupVersionKind, ip *specificInformersMap) (*cache.ListWatch, error) {
+	// Kubernetes APIs work against Resources, not GroupVersionKinds.  Map the
+	// groupVersionKind to the Resource API we will use.
+	mapping, err := ip.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return nil, err
+	}
+	dynamicClient, err := dynamic.NewForConfig(ip.config)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: the functions that make use of this ListWatch should be adapted to
+	//  pass in their own contexts instead of relying on this fixed one here.
+	ctx := context.TODO()
+	// Create a new ListWatch for the obj
+	return &cache.ListWatch{
+		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+			if ip.namespace != "" && mapping.Scope.Name() != meta.RESTScopeNameRoot {
+				return dynamicClient.Resource(mapping.Resource).Namespace(ip.namespace).List(ctx, opts)
+			}
+			return dynamicClient.Resource(mapping.Resource).List(ctx, opts)
+		},
+		// Setup the watch function
+		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+			// Watch needs to be set to true separately
+			opts.Watch = true
+			if ip.namespace != "" && mapping.Scope.Name() != meta.RESTScopeNameRoot {
+				return dynamicClient.Resource(mapping.Resource).Namespace(ip.namespace).Watch(ctx, opts)
+			}
+			return dynamicClient.Resource(mapping.Resource).Watch(ctx, opts)
+		},
+	}, nil
+}
+
+// resyncPeriod returns a function which generates a duration each time it is
+// invoked; this is so that multiple controllers don't get into lock-step and all
+// hammer the apiserver with list requests simultaneously.
+func resyncPeriod(resync time.Duration) func() time.Duration {
+	return func() time.Duration {
+		// the factor will fall into [0.9, 1.1)
+		factor := rand.Float64()/5.0 + 0.9
+		return time.Duration(float64(resync.Nanoseconds()) * factor)
+	}
 }

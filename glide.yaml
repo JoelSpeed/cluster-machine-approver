@@ -23,4 +23,11 @@ import:
 - package: github.com/prometheus/client_golang
   version: v0.9.4
   subpackages:
-  - prometheus        
+  - prometheus
+- package: github.com/cespare/xxhash
+  version: v2
+  repo: git@github.com:cespare/xxhash
+  subpackages:
+  - v2
+- package: golang.org/x/crypto
+  version: bac4c82f69751a6dd76e702d54b3ceb88adab236

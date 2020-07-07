@@ -18,40 +18,11 @@ set -e
 
 source $(dirname ${BASH_SOURCE})/common.sh
 
-header_text "running go vet"
+REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+cd "${REPO_ROOT}"
 
-go vet ./pkg/...
+header_text "running golangci-lint"
+make lint
 
-# go get is broken for golint.  re-enable this once it is fixed.
-#header_text "running golint"
-#
-#golint -set_exit_status ./pkg/...
-
-header_text "running gometalinter.v2"
-
-gometalinter.v2 --disable-all \
-    --deadline 5m \
-    --enable=misspell \
-    --enable=structcheck \
-    --enable=golint \
-    --enable=deadcode \
-    --enable=goimports \
-    --enable=errcheck \
-    --enable=varcheck \
-    --enable=goconst \
-    --enable=gas \
-    --enable=unparam \
-    --enable=ineffassign \
-    --enable=nakedret \
-    --enable=interfacer \
-    --enable=misspell \
-    --enable=gocyclo \
-    --line-length=170 \
-    --enable=lll \
-    --dupl-threshold=400 \
-    --enable=dupl \
-    --skip=atomic \
-    ./pkg/...
-# TODO: Enable these as we fix them to make them pass
-#    --enable=maligned \
-#    --enable=safesql \
+header_text "verifying modules"
+make modules verify-modules

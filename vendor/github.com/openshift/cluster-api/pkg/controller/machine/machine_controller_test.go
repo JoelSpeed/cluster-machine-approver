@@ -38,14 +38,11 @@ const timeout = time.Second * 5
 func TestReconcile(t *testing.T) {
 	instance := &machinev1beta1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
-		Spec: machinev1beta1.MachineSpec{
-			Versions: machinev1beta1.MachineVersionInfo{Kubelet: "1.10.3"},
-		},
 	}
 
 	// Setup the Manager and Controller.  Wrap the Controller Reconcile function so it writes each request to a
 	// channel when it is finished.
-	mgr, err := manager.New(cfg, manager.Options{})
+	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
 	if err != nil {
 		t.Fatalf("error creating new manager: %v", err)
 	}

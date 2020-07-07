@@ -18,6 +18,7 @@ package sysfs
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 
 	"github.com/prometheus/procfs/internal/util"
@@ -109,7 +110,7 @@ func (fs FS) PowerSupplyClass() (PowerSupplyClass, error) {
 
 	dirs, err := ioutil.ReadDir(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list power supplies at %q: %v", path, err)
+		return nil, err
 	}
 
 	psc := make(PowerSupplyClass, len(dirs))
@@ -134,13 +135,16 @@ func parsePowerSupply(path string) (*PowerSupply, error) {
 
 	var ps PowerSupply
 	for _, f := range files {
-		if f.IsDir() {
+		if !f.Mode().IsRegular() {
 			continue
 		}
 
 		name := filepath.Join(path, f.Name())
 		value, err := util.SysReadFile(name)
 		if err != nil {
+			if os.IsNotExist(err) || err.Error() == "operation not supported" || err.Error() == "invalid argument" {
+				continue
+			}
 			return nil, fmt.Errorf("failed to read file %q: %v", name, err)
 		}
 

@@ -18,9 +18,11 @@ package controller_test
 
 import (
 	"fmt"
+	rt "runtime"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -72,6 +74,42 @@ var _ = Describe("controller.Controller", func() {
 			Expect(c).To(BeNil())
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("expected error"))
+
+			close(done)
+		})
+
+		It("should not return an error if two controllers are registered with different names", func(done Done) {
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			c1, err := controller.New("c1", m, controller.Options{Reconciler: rec})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c1).ToNot(BeNil())
+
+			c2, err := controller.New("c2", m, controller.Options{Reconciler: rec})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c2).ToNot(BeNil())
+
+			close(done)
+		})
+
+		It("should not leak goroutines when stop", func(done Done) {
+			// TODO(directxman12): After closing the proper leaks on watch this must be reduced to 0
+			// The leaks currently come from the event-related code (as in corev1.Event).
+			threshold := 3
+
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = controller.New("new-controller", m, controller.Options{Reconciler: rec})
+			Expect(err).NotTo(HaveOccurred())
+
+			startGoroutines := rt.NumGoroutine()
+			s := make(chan struct{})
+			close(s)
+
+			Expect(m.Start(s)).NotTo(HaveOccurred())
+			Expect(rt.NumGoroutine() - startGoroutines).To(BeNumerically("<=", threshold))
 
 			close(done)
 		})
